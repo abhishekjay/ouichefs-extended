@@ -16,6 +16,7 @@
 
 #include "ouichefs.h"
 #include "bitmap.h"
+#include "extent_ioctl.h"
 
 /*
  * Map the buffer_head passed in argument with the iblock-th block of the file
@@ -46,7 +47,10 @@ static int ouichefs_file_get_block(struct inode *inode, sector_t iblock,
 	 * Check if iblock is already allocated. If not and create is true,
 	 * allocate it. Else, get the physical block number.
 	 */
-	if (index->blocks[iblock] == 0) {
+
+	bno = le32_to_cpu(index->extents[iblock].start);
+
+	if (bno == 0) {
 		if (!create) {
 			ret = 0;
 			goto brelse_index;
@@ -58,13 +62,13 @@ static int ouichefs_file_get_block(struct inode *inode, sector_t iblock,
 			goto brelse_index;
 		}
 
-		index->blocks[iblock] = cpu_to_le32(bno);
-		++inode->i_blocks;
+		index->extents[iblock].start = cpu_to_le32(bno);
+		index->extents[iblock].count = cpu_to_le32(1);
+
+		inode->i_blocks++;
 
 		mark_inode_dirty(inode);
 		mark_buffer_dirty(bh_index);
-	} else {
-		bno = le32_to_cpu(index->blocks[iblock]);
 	}
 
 	/* Map the physical block to the given buffer_head */
@@ -168,17 +172,25 @@ ssize_t ouichefs_read(struct file *file, char __user *buf, size_t count, loff_t 
 		count = filesize - *ppos;
 
 	unsigned long block_idx = *ppos / block_size;
+
+	//new max limit = 512
+	if (block_idx >= OUICHEFS_MAX_EXTENTS)
+		return -EIO;
+
 	size_t offset = *ppos % block_size;
-	size_t to_copy = min(count, block_size - offset);
+	size_t to_copy = min_t(size_t, count, block_size - offset);
 	
 	// read block index
 	bh_index = sb_bread(sb, ci->index_block);
 	if (!bh_index)
 		return -EIO;
+
 	index = (struct ouichefs_file_index_block *)bh_index->b_data;
 
 	// find real physical block number
-	phys_block = le32_to_cpu(index->blocks[block_idx]);
+	//phys_block = le32_to_cpu(index->blocks[block_idx]);
+	// using extents
+	phys_block = le32_to_cpu(index->extents[block_idx].start);
 	brelse(bh_index); //done with index block
 
 	if (phys_block == 0)
@@ -201,7 +213,7 @@ ssize_t ouichefs_read(struct file *file, char __user *buf, size_t count, loff_t 
 
 ssize_t ouichefs_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
 {
-struct inode *inode = file_inode(file);
+	struct inode *inode = file_inode(file);
 	struct super_block *sb = inode->i_sb;
 	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
 	struct ouichefs_inode_info *ci = OUICHEFS_INODE(inode);
@@ -215,11 +227,13 @@ struct inode *inode = file_inode(file);
 		*ppos = i_size_read(inode);
 
 	unsigned long block_idx = *ppos / block_size;
-	if (block_idx >= OUICHEFS_FILE_MAX_BLOCKS)
+	
+	//if (block_idx >= OUICHEFS_FILE_MAX_BLOCKS)
+	if (block_idx >= OUICHEFS_MAX_EXTENTS)
 		return -ENOSPC;
 
 	size_t offset = *ppos % block_size;
-	size_t to_copy = min(count, block_size - offset);
+	size_t to_copy = min_t(size_t, count, block_size - offset);
 
 	bh_index = sb_bread(sb, ci->index_block); // read index block
 	if (!bh_index)
@@ -227,7 +241,8 @@ struct inode *inode = file_inode(file);
 
 	index = (struct ouichefs_file_index_block *)bh_index->b_data;
 
-	phys_block = le32_to_cpu(index->blocks[block_idx]); //check if block is allocated yet
+	//phys_block = le32_to_cpu(index->blocks[block_idx]); //check if block is allocated yet
+	phys_block = le32_to_cpu(index->extents[block_idx].start);
 	
 	if (phys_block == 0) {
 		//allocate a new block from disk
@@ -237,7 +252,10 @@ struct inode *inode = file_inode(file);
 			return -ENOSPC;
 		}
 
-		index->blocks[block_idx] = cpu_to_le32(phys_block); //update index block and save
+		//index->blocks[block_idx] = cpu_to_le32(phys_block); //update index block and save
+		index->extents[block_idx].start = cpu_to_le32(phys_block);
+		index->extents[block_idx].count = cpu_to_le32(1);
+	
 		mark_buffer_dirty(bh_index);
 
 		inode->i_blocks++;
@@ -272,6 +290,43 @@ struct inode *inode = file_inode(file);
 	return to_copy;
 }
 
+long ouichefs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	struct inode *inode = file_inode(file);
+	struct super_block *sb = inode->i_sb;
+	struct ouichefs_inode_info *ci = OUICHEFS_INODE(inode);
+	struct buffer_head *bh;
+	struct ouichefs_file_index_block *index;
+	int i, num_extents = 0;
+
+	if (cmd != OUICHEFS_IOC_GET_EXTENTS)
+		return -ENOTTY;
+
+	bh = sb_bread(sb, ci->index_block);
+	if (!bh)
+		return -EIO;
+
+	index = (struct ouichefs_file_index_block *)bh->b_data;
+
+	for (i = 0; i < OUICHEFS_MAX_EXTENTS; i++) {
+		if (le32_to_cpu(index->extents[i].count) == 0)
+			break;
+		num_extents++;
+	}
+
+	pr_info("ouichefs: extents for inode %lu: %d extent(s)\n", inode->i_ino, num_extents);
+
+	for (i = 0; i < num_extents; i++) {
+		uint32_t start = le32_to_cpu(index->extents[i].start);
+		uint32_t count = le32_to_cpu(index->extents[i].count);
+		pr_info(" [%d] start=%u count=%u (blocks %u-%u)\n",
+				i, start, count, start, start + count - 1);
+	}
+
+	brelse(bh);
+	return 0;
+}
+
 const struct address_space_operations ouichefs_aops = {
 	.readahead = ouichefs_readahead,
 	.writepage = ouichefs_writepage,
@@ -284,6 +339,7 @@ const struct file_operations ouichefs_file_ops = {
 	.llseek = generic_file_llseek,
 	.read = ouichefs_read,
 	.write = ouichefs_write,
+	.unlocked_ioctl = ouichefs_ioctl,
 	.fsync = generic_file_fsync,
 };
 
@@ -294,31 +350,36 @@ int ouichefs_truncate(struct inode *inode)
 	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
 	struct ouichefs_inode_info *inode_info = OUICHEFS_INODE(inode);
 	struct buffer_head *bh;
+	struct ouichefs_file_index_block *index;
 	size_t next_num_blocks;
+	size_t i;
 
 	bh = sb_bread(sb, inode_info->index_block);
-	if (!bh) {
+
+	if (!bh)
 		ret = -EIO;
-		goto out;
-	}
 
-	ret = block_truncate_page(inode->i_mapping, inode->i_size, ouichefs_file_get_block);
-	if (ret < 0)
-		goto out_brelse;
+	index = (struct ouichefs_file_index_block *)bh->b_data;
 
-	struct ouichefs_file_index_block *index = (struct ouichefs_file_index_block *)bh->b_data;
+	//ret = block_truncate_page(inode->i_mapping, inode->i_size, ouichefs_file_get_block);
+	//if (ret < 0)
+		//goto out_brelse;
+
+	//struct ouichefs_file_index_block *index = (struct ouichefs_file_index_block *)bh->b_data;
 
 	next_num_blocks = (inode->i_size + sb->s_blocksize - 1) >> sb->s_blocksize_bits;
-	for (size_t i = next_num_blocks; i < OUICHEFS_FILE_MAX_BLOCKS; ++i) {
-		uint32_t bno = le32_to_cpu(index->blocks[i]);
+
+	for (i = next_num_blocks; i < OUICHEFS_MAX_EXTENTS; ++i) {
+		uint32_t bno = le32_to_cpu(index->extents[i].start);
 
 		if (!bno)
 			continue;
 
 		put_block(sbi, bno);
-		--inode->i_blocks;
+		inode->i_blocks--;
 
-		index->blocks[i] = cpu_to_le32(0);
+		index->extents[i].start = cpu_to_le32(0);
+		index->extents[i].count = cpu_to_le32(0);
 	}
 
 	mark_buffer_dirty(bh);
@@ -326,10 +387,5 @@ int ouichefs_truncate(struct inode *inode)
 
 	mark_inode_dirty(inode);
 
-	return 0;
-
-out_brelse:
-	brelse(bh);
-out:
 	return ret;
 }
