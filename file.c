@@ -12,6 +12,7 @@
 #include <linux/fs.h>
 #include <linux/buffer_head.h>
 #include <linux/mpage.h>
+#include <linux/uaccess.h>
 
 #include "ouichefs.h"
 #include "bitmap.h"
@@ -148,6 +149,129 @@ static int ouichefs_write_end(struct file *file, struct address_space *mapping,
 	return ret;
 }
 
+ssize_t ouichefs_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
+{
+	struct inode *inode = file_inode(file);
+	struct super_block *sb = inode->i_sb;
+	struct buffer_head *bh_data, *bh_index;
+	struct ouichefs_inode_info *ci = OUICHEFS_INODE(inode);
+	struct ouichefs_file_index_block *index;
+	char *data;
+	size_t block_size = sb->s_blocksize;
+	loff_t filesize = i_size_read(inode);
+	uint32_t phys_block;
+
+	if (*ppos >= filesize)
+		return 0;
+	
+	if (*ppos + count > filesize)
+		count = filesize - *ppos;
+
+	unsigned long block_idx = *ppos / block_size;
+	size_t offset = *ppos % block_size;
+	size_t to_copy = min(count, block_size - offset);
+	
+	// read block index
+	bh_index = sb_bread(sb, ci->index_block);
+	if (!bh_index)
+		return -EIO;
+	index = (struct ouichefs_file_index_block *)bh_index->b_data;
+
+	// find real physical block number
+	phys_block = le32_to_cpu(index->blocks[block_idx]);
+	brelse(bh_index); //done with index block
+
+	if (phys_block == 0)
+		return -EIO;
+
+	bh_data = sb_bread(sb, phys_block);
+	if (!bh_data)
+		return -EIO;
+
+	data = bh_data->b_data + offset;
+	if (copy_to_user(buf, data, to_copy)) {
+		brelse(bh_data);
+		return -EFAULT;
+	}
+
+	brelse(bh_data);
+	*ppos += to_copy;
+	return to_copy;
+}
+
+ssize_t ouichefs_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
+{
+struct inode *inode = file_inode(file);
+	struct super_block *sb = inode->i_sb;
+	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
+	struct ouichefs_inode_info *ci = OUICHEFS_INODE(inode);
+	struct buffer_head *bh_data, *bh_index;
+	struct ouichefs_file_index_block *index;
+	char *data;
+	size_t block_size = sb->s_blocksize;
+	uint32_t phys_block;
+
+	if (file->f_flags & O_APPEND)
+		*ppos = i_size_read(inode);
+
+	unsigned long block_idx = *ppos / block_size;
+	if (block_idx >= OUICHEFS_FILE_MAX_BLOCKS)
+		return -ENOSPC;
+
+	size_t offset = *ppos % block_size;
+	size_t to_copy = min(count, block_size - offset);
+
+	bh_index = sb_bread(sb, ci->index_block); // read index block
+	if (!bh_index)
+		return -EIO;
+
+	index = (struct ouichefs_file_index_block *)bh_index->b_data;
+
+	phys_block = le32_to_cpu(index->blocks[block_idx]); //check if block is allocated yet
+	
+	if (phys_block == 0) {
+		//allocate a new block from disk
+		phys_block = get_free_block(sbi);
+		if (!phys_block) {
+			brelse(bh_index);
+			return -ENOSPC;
+		}
+
+		index->blocks[block_idx] = cpu_to_le32(phys_block); //update index block and save
+		mark_buffer_dirty(bh_index);
+
+		inode->i_blocks++;
+		mark_inode_dirty(inode);
+	}
+	brelse(bh_index);
+
+	//now there is a physical block to write to
+	bh_data = sb_bread(sb, phys_block); //load first using sb_bread
+	if (!bh_data)
+		return -EIO;
+
+	lock_buffer(bh_data);
+	data = bh_data->b_data + offset;
+	if (copy_from_user(data, buf, to_copy)) {
+		unlock_buffer(bh_data);
+		brelse(bh_data);
+		return -EFAULT;
+	}
+
+	set_buffer_uptodate(bh_data);
+	mark_buffer_dirty(bh_data); // Mark for disk sync
+	unlock_buffer(bh_data);
+	brelse(bh_data);
+
+	*ppos += to_copy;
+	if (*ppos > i_size_read(inode)) {
+		i_size_write(inode, *ppos);
+		mark_inode_dirty(inode);
+	}
+
+	return to_copy;
+}
+
 const struct address_space_operations ouichefs_aops = {
 	.readahead = ouichefs_readahead,
 	.writepage = ouichefs_writepage,
@@ -158,8 +282,8 @@ const struct address_space_operations ouichefs_aops = {
 const struct file_operations ouichefs_file_ops = {
 	.owner = THIS_MODULE,
 	.llseek = generic_file_llseek,
-	.read_iter = generic_file_read_iter,
-	.write_iter = generic_file_write_iter,
+	.read = ouichefs_read,
+	.write = ouichefs_write,
 	.fsync = generic_file_fsync,
 };
 
