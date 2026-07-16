@@ -78,8 +78,15 @@ struct ouichefs_sb_info {
 	unsigned long *bfree_bitmap; /* In-memory free blocks bitmap */
 };
 
+struct ouichefs_extent {
+	uint32_t start;
+	uint32_t count;
+};
+
+#define OUICHEFS_MAX_EXTENTS (OUICHEFS_BLOCK_SIZE / sizeof(struct ouichefs_extent))
+
 struct ouichefs_file_index_block {
-	__le32 blocks[OUICHEFS_FILE_MAX_BLOCKS];
+	struct ouichefs_extent extents[OUICHEFS_MAX_EXTENTS];
 };
 
 struct ouichefs_dir_block {

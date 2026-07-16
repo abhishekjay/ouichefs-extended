@@ -123,11 +123,13 @@ static void ouichefs_evict_inode(struct inode *inode)
 		if (S_ISREG(inode->i_mode)) {
 			file_index = (struct ouichefs_file_index_block *)bh->b_data;
 
-			for (i = 0; i < OUICHEFS_FILE_MAX_BLOCKS; ++i) {
-				if (!le32_to_cpu(file_index->blocks[i]))
+			for (i = 0; i < OUICHEFS_MAX_EXTENTS; ++i) {
+				uint32_t start_block = le32_to_cpu(file_index->extents[i].start);
+
+				if (!start_block)
 					continue;
 
-				put_block(sbi, le32_to_cpu(file_index->blocks[i]));
+				put_block(sbi, start_block);
 			}
 		}
 
