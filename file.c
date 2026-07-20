@@ -12,6 +12,7 @@
 #include <linux/fs.h>
 #include <linux/buffer_head.h>
 #include <linux/mpage.h>
+#include <linux/uio.h>
 
 #include "ouichefs.h"
 #include "bitmap.h"
@@ -155,11 +156,224 @@ const struct address_space_operations ouichefs_aops = {
 	.write_end = ouichefs_write_end
 };
 
+static ssize_t ouichefs_file_read_iter(struct kiocb *iocb,
+                                       struct iov_iter *to)
+{
+        struct file *file = iocb->ki_filp;
+        struct inode *inode = file_inode(file);
+        struct super_block *sb = inode->i_sb;
+        struct ouichefs_inode_info *ci = OUICHEFS_INODE(inode);
+
+        struct buffer_head *bh_index;
+        struct buffer_head *bh_data;
+        struct ouichefs_file_index_block *index;
+
+        loff_t pos = iocb->ki_pos;
+        size_t requested = iov_iter_count(to);
+        size_t total_copied = 0;
+
+        if (pos < 0)
+                return -EINVAL;
+
+        if (requested == 0)
+                return 0;
+
+        if (pos >= inode->i_size)
+                return 0;
+
+        if (requested > inode->i_size - pos)
+                requested = inode->i_size - pos;
+
+        bh_index = sb_bread(sb, ci->index_block);
+        if (!bh_index)
+                return -EIO;
+
+        index = (struct ouichefs_file_index_block *)bh_index->b_data;
+
+        while (total_copied < requested) {
+                sector_t logical_block;
+                unsigned int block_offset;
+                unsigned int block_number;
+                size_t bytes_to_copy;
+                size_t copied;
+
+                logical_block = pos >> sb->s_blocksize_bits;
+                block_offset = pos & (sb->s_blocksize - 1);
+
+                if (logical_block >= OUICHEFS_FILE_MAX_BLOCKS)
+                        break;
+
+                bytes_to_copy = min_t(size_t,
+                                      requested - total_copied,
+                                      sb->s_blocksize - block_offset);
+
+                block_number =
+                        le32_to_cpu(index->blocks[logical_block]);
+
+                if (block_number == 0) {
+                        copied = iov_iter_zero(bytes_to_copy, to);
+                } else {
+                        bh_data = sb_bread(sb, block_number);
+                        if (!bh_data) {
+                                brelse(bh_index);
+
+                                if (total_copied == 0)
+                                        return -EIO;
+
+                                iocb->ki_pos = pos;
+                                return total_copied;
+                        }
+
+                        copied = copy_to_iter(
+                                bh_data->b_data + block_offset,
+                                bytes_to_copy,
+                                to
+                        );
+
+                        brelse(bh_data);
+                }
+
+                if (copied == 0)
+                        break;
+
+                pos += copied;
+                total_copied += copied;
+
+                if (copied < bytes_to_copy)
+                        break;
+        }
+
+        brelse(bh_index);
+
+        iocb->ki_pos = pos;
+
+        return total_copied;
+}
+
+static ssize_t ouichefs_file_write_iter(struct kiocb *iocb,
+                                        struct iov_iter *from)
+{
+        struct file *file = iocb->ki_filp;
+        struct inode *inode = file_inode(file);
+        struct super_block *sb = inode->i_sb;
+        struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
+        struct ouichefs_inode_info *ci = OUICHEFS_INODE(inode);
+
+        struct buffer_head *bh_index;
+        struct buffer_head *bh_data;
+        struct ouichefs_file_index_block *index;
+
+        loff_t pos = iocb->ki_pos;
+        size_t requested = iov_iter_count(from);
+        size_t total_copied = 0;
+
+        if (file->f_flags & O_APPEND)
+                pos = inode->i_size;
+
+        if (pos < 0)
+                return -EINVAL;
+
+        if (requested == 0)
+                return 0;
+
+        bh_index = sb_bread(sb, ci->index_block);
+        if (!bh_index)
+                return -EIO;
+
+        index = (struct ouichefs_file_index_block *)bh_index->b_data;
+
+        while (total_copied < requested) {
+                sector_t logical_block;
+                unsigned int block_offset;
+                unsigned int block_number;
+                size_t bytes_to_copy;
+                size_t copied;
+
+                logical_block = pos >> sb->s_blocksize_bits;
+                block_offset = pos & (sb->s_blocksize - 1);
+
+                if (logical_block >= OUICHEFS_FILE_MAX_BLOCKS)
+                        break;
+
+                bytes_to_copy = min_t(size_t,
+                                      requested - total_copied,
+                                      sb->s_blocksize - block_offset);
+
+                block_number =
+                        le32_to_cpu(index->blocks[logical_block]);
+
+                if (block_number == 0) {
+                        block_number = get_free_block(sbi);
+
+                        if (block_number == 0) {
+                                if (total_copied == 0) {
+                                        brelse(bh_index);
+                                        return -ENOSPC;
+                                }
+
+                                break;
+                        }
+
+                        index->blocks[logical_block] =
+                                cpu_to_le32(block_number);
+
+                        inode->i_blocks++;
+
+                        mark_buffer_dirty(bh_index);
+                        sync_dirty_buffer(bh_index);
+                }
+
+                bh_data = sb_bread(sb, block_number);
+                if (!bh_data) {
+                        if (total_copied == 0) {
+                                brelse(bh_index);
+                                return -EIO;
+                        }
+
+                        break;
+                }
+
+                copied = copy_from_iter(
+                        bh_data->b_data + block_offset,
+                        bytes_to_copy,
+                        from
+                );
+
+                if (copied > 0) {
+                        mark_buffer_dirty(bh_data);
+                        sync_dirty_buffer(bh_data);
+                }
+
+                brelse(bh_data);
+
+                if (copied == 0)
+                        break;
+
+                pos += copied;
+                total_copied += copied;
+
+                if (copied < bytes_to_copy)
+                        break;
+        }
+
+        brelse(bh_index);
+
+        if (pos > inode->i_size)
+                i_size_write(inode, pos);
+
+        inode->i_mtime = inode_set_ctime_current(inode);
+        mark_inode_dirty(inode);
+
+        iocb->ki_pos = pos;
+
+        return total_copied;
+}
+
 const struct file_operations ouichefs_file_ops = {
 	.owner = THIS_MODULE,
 	.llseek = generic_file_llseek,
-	.read_iter = generic_file_read_iter,
-	.write_iter = generic_file_write_iter,
+	.read_iter = ouichefs_file_read_iter,
+	.write_iter = ouichefs_file_write_iter,
 	.fsync = generic_file_fsync,
 };
 
