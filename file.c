@@ -23,6 +23,33 @@
  * represented by inode. If the requested block is not allocated and create is
  * true, allocate a new block on disk and map it.
  */
+
+static uint32_t ouichefs_extent_get_block(struct ouichefs_extent *extents, uint32_t logical_block)
+{
+	uint32_t cumul = 0;
+	int i;
+
+	for (i = 0; i < OUICHEFS_MAX_EXTENTS; i++) {
+		uint32_t start = le32_to_cpu(extents[i].start);
+		uint32_t count = le32_to_cpu(extents[i].count);
+
+		if(count == 0)
+			break;
+
+		if (logical_block < cumul + count) {
+
+			if(start == 0)
+				return 0;
+
+			return start + (logical_block - cumul);
+		}
+
+		cumul += count;
+	}
+
+	return 0;
+}
+
 static int ouichefs_file_get_block(struct inode *inode, sector_t iblock,
 				   struct buffer_head *bh_result, int create)
 {
@@ -34,8 +61,8 @@ static int ouichefs_file_get_block(struct inode *inode, sector_t iblock,
 	int ret = 0, bno;
 
 	/* If block number exceeds filesize, fail */
-	if (iblock >= OUICHEFS_FILE_MAX_BLOCKS)
-		return -EFBIG;
+	//if (iblock >= OUICHEFS_FILE_MAX_BLOCKS)
+		//return -EFBIG;
 
 	/* Read index block from disk */
 	bh_index = sb_bread(sb, ci->index_block);
@@ -48,7 +75,8 @@ static int ouichefs_file_get_block(struct inode *inode, sector_t iblock,
 	 * allocate it. Else, get the physical block number.
 	 */
 
-	bno = le32_to_cpu(index->extents[iblock].start);
+	//bno = le32_to_cpu(index->extents[iblock].start);
+	bno = ouichefs_extent_get_block(index->extents, iblock);
 
 	if (bno == 0) {
 		if (!create) {
@@ -62,13 +90,18 @@ static int ouichefs_file_get_block(struct inode *inode, sector_t iblock,
 			goto brelse_index;
 		}
 
-		index->extents[iblock].start = cpu_to_le32(bno);
-		index->extents[iblock].count = cpu_to_le32(1);
+		if (iblock < OUICHEFS_MAX_EXTENTS) {
+			index->extents[iblock].start = cpu_to_le32(bno);
+			index->extents[iblock].count = cpu_to_le32(1);
 
-		inode->i_blocks++;
+			inode->i_blocks++;
 
-		mark_inode_dirty(inode);
-		mark_buffer_dirty(bh_index);
+			mark_inode_dirty(inode);
+			mark_buffer_dirty(bh_index);
+		} else {
+			ret = -EFBIG;
+			goto brelse_index;
+		}
 	}
 
 	/* Map the physical block to the given buffer_head */
@@ -172,11 +205,6 @@ ssize_t ouichefs_read(struct file *file, char __user *buf, size_t count, loff_t 
 		count = filesize - *ppos;
 
 	unsigned long block_idx = *ppos / block_size;
-
-	//new max limit = 512
-	if (block_idx >= OUICHEFS_MAX_EXTENTS)
-		return -EIO;
-
 	size_t offset = *ppos % block_size;
 	size_t to_copy = min_t(size_t, count, block_size - offset);
 	
@@ -190,7 +218,7 @@ ssize_t ouichefs_read(struct file *file, char __user *buf, size_t count, loff_t 
 	// find real physical block number
 	//phys_block = le32_to_cpu(index->blocks[block_idx]);
 	// using extents
-	phys_block = le32_to_cpu(index->extents[block_idx].start);
+	phys_block = ouichefs_extent_get_block(index->extents, block_idx);
 	brelse(bh_index); //done with index block
 
 	if (phys_block == 0)
