@@ -157,6 +157,31 @@ const struct address_space_operations ouichefs_aops = {
 	.write_end = ouichefs_write_end
 };
 
+static uint32_t ouichefs_extent_get_block(
+        struct ouichefs_extent *extents,
+        uint32_t logical_block)
+{
+        uint32_t i;
+
+        for (i = 0; i < OUICHEFS_MAX_EXTENTS; i++) {
+                uint32_t start;
+                uint32_t count;
+
+                start = le32_to_cpu(extents[i].start);
+                count = le32_to_cpu(extents[i].count);
+
+                if (count == 0)
+                        return 0;
+
+                if (logical_block < count)
+                        return start + logical_block;
+
+                logical_block -= count;
+        }
+
+        return 0;
+}
+
 static ssize_t ouichefs_file_read_iter(struct kiocb *iocb,
                                        struct iov_iter *to)
 {
@@ -209,7 +234,10 @@ static ssize_t ouichefs_file_read_iter(struct kiocb *iocb,
                                       sb->s_blocksize - block_offset);
 
                 block_number =
-                        le32_to_cpu(index->extents[logical_block].start);
+                        ouichefs_extent_get_block(
+                                index->extents,
+                                logical_block
+                        );
 
                 if (block_number == 0) {
                         copied = iov_iter_zero(bytes_to_copy, to);
