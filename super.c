@@ -104,7 +104,7 @@ static void ouichefs_evict_inode(struct inode *inode)
 	struct buffer_head *bh;
 	struct ouichefs_file_index_block *file_index;
 	uint32_t ino = inode->i_ino;
-	uint32_t i;
+	uint32_t i, j;
 
 	truncate_inode_pages_final(&inode->i_data);
 
@@ -123,13 +123,17 @@ static void ouichefs_evict_inode(struct inode *inode)
 		if (S_ISREG(inode->i_mode)) {
 			file_index = (struct ouichefs_file_index_block *)bh->b_data;
 
+			// free all blocks in each extent  
 			for (i = 0; i < OUICHEFS_MAX_EXTENTS; ++i) {
 				uint32_t start_block = le32_to_cpu(file_index->extents[i].start);
+				uint32_t count = le32_to_cpu(file_index->extents[i].count);
 
-				if (!start_block)
-					continue;
+				if (!start_block || !count)
+					break;
 
-				put_block(sbi, start_block);
+				for (j = 0; j < count; j++) {
+					put_block(sbi, start_block + j);
+				}
 			}
 		}
 
