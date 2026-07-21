@@ -54,4 +54,4 @@ dkms.conf
 
 # Other
 mkfs/test.img
-compile_commands.json
+compile_commands.json.vscode/

@@ -8,14 +8,28 @@
 #define _OUICHEFS_H
 
 #include <linux/fs.h>
+#include <linux/ioctl.h>
 
 #define OUICHEFS_MAGIC 0x48434957
+#define OUICHEFS_IOC_MAGIC 'O'
+#define OUICHEFS_IOC_GET_EXTENTS _IO(OUICHEFS_IOC_MAGIC, 1)
 
 #define OUICHEFS_SB_BLOCK_NR 0
 
 #define OUICHEFS_BLOCK_SIZE (1 << 12) /* 4 KiB */
-#define OUICHEFS_FILE_MAX_BLOCKS (OUICHEFS_BLOCK_SIZE >> 2)
-#define OUICHEFS_MAX_FILESIZE (OUICHEFS_FILE_MAX_BLOCKS * OUICHEFS_BLOCK_SIZE) /* 4 MiB */
+
+struct ouichefs_extent {
+        __le32 start;
+        __le32 count;
+};
+
+#define OUICHEFS_MAX_EXTENTS \
+        (OUICHEFS_BLOCK_SIZE / sizeof(struct ouichefs_extent))
+
+#define OUICHEFS_FILE_MAX_BLOCKS OUICHEFS_MAX_EXTENTS
+
+#define OUICHEFS_MAX_FILESIZE \
+        (OUICHEFS_FILE_MAX_BLOCKS * OUICHEFS_BLOCK_SIZE)
 #define OUICHEFS_FILENAME_LEN 28
 #define OUICHEFS_MAX_SUBFILES 128
 
@@ -79,7 +93,7 @@ struct ouichefs_sb_info {
 };
 
 struct ouichefs_file_index_block {
-	__le32 blocks[OUICHEFS_FILE_MAX_BLOCKS];
+        struct ouichefs_extent extents[OUICHEFS_MAX_EXTENTS];
 };
 
 struct ouichefs_dir_block {
