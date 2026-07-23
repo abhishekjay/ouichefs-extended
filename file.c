@@ -20,7 +20,7 @@
 #include "extent_ioctl.h"
 
 //module parameter for reservation window size
-static uint32_t reservation_size = 8;
+uint32_t reservation_size = 8;
 module_param(reservation_size, uint, 0644);
 MODULE_PARM_DESC(reservation_size, "Default extent block reservation size");
 
@@ -29,6 +29,8 @@ static void ouichefs_run_gc(struct super_block *sb)
 	struct inode *inode;
 	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
 	uint32_t j;
+
+	sbi->gc_runs++;
 
 	//iterate safely over master list of all loaded inodes
 	spin_lock(&sb->s_inode_list_lock);

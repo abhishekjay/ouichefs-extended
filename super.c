@@ -258,6 +258,7 @@ static void ouichefs_put_super(struct super_block *sb)
 	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
 
 	if (sbi) {
+		ouichefs_sysfs_sb_exit(sbi);
 		kfree(sbi->ifree_bitmap);
 		kfree(sbi->bfree_bitmap);
 		kfree(sbi);
@@ -420,6 +421,9 @@ int ouichefs_fill_super(struct super_block *sb, void *data, int silent)
 		ret = -ENOMEM;
 		goto free_bfree;
 	}
+
+	sbi->gc_runs = 0;
+	ouichefs_sysfs_sb_init(sbi, sb);
 
 	return 0;
 

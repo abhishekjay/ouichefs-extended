@@ -67,6 +67,7 @@ static int __init ouichefs_init(void)
 	}
 
 	pr_info("module loaded\n");
+	ouichefs_sysfs_init();
 	return 0;
 
 err_inode:
@@ -78,6 +79,8 @@ err:
 static void __exit ouichefs_exit(void)
 {
 	int ret;
+
+	ouichefs_sysfs_exit();
 
 	ret = unregister_filesystem(&ouichefs_file_system_type);
 	if (ret)
