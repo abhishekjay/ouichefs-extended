@@ -37,10 +37,14 @@ static struct inode *ouichefs_alloc_inode(struct super_block *sb)
 {
 	struct ouichefs_inode_info *ci;
 
-	/* ci = kzalloc(sizeof(struct ouichefs_inode_info), GFP_KERNEL); */
 	ci = kmem_cache_alloc(ouichefs_inode_cache, GFP_KERNEL);
 	if (!ci)
 		return NULL;
+
+	//initialising reservation tracking to 0 when loading an inode
+	ci->i_reserved_start = 0;
+	ci->i_reserved_count = 0;
+
 	inode_init_once(&ci->vfs_inode);
 	return &ci->vfs_inode;
 }
@@ -105,6 +109,7 @@ static void ouichefs_evict_inode(struct inode *inode)
 	struct ouichefs_file_index_block *file_index;
 	uint32_t ino = inode->i_ino;
 	uint32_t i, j;
+	uint32_t r_start = 0, r_count = 0;
 
 	truncate_inode_pages_final(&inode->i_data);
 
@@ -113,6 +118,14 @@ static void ouichefs_evict_inode(struct inode *inode)
 	 * If we fail to read the index block, cleanup inode anyway and
 	 * lose this file/directory's blocks forever.
 	 */
+	//safely release any pending reservations before freeing extents
+	spin_lock(&inode->i_lock);
+
+	if (r_count > 0) {
+		for (j = 0; j < r_count; j++)
+			put_block(sbi, r_start + j);
+	}
+
 	if (!inode->i_nlink && inode_info->index_block) {
 		bh = sb_bread(sb, inode_info->index_block);
 		if (!bh) {
@@ -133,7 +146,6 @@ static void ouichefs_evict_inode(struct inode *inode)
 
 				for (j = 0; j < count; j++)
 					put_block(sbi, start_block + j);
-
 			}
 		}
 

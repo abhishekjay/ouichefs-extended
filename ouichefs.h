@@ -55,6 +55,10 @@ struct ouichefs_inode {
 
 struct ouichefs_inode_info {
 	uint32_t index_block;
+	//write time block reservation
+	uint32_t i_reserved_start;
+	uint32_t i_reserved_count;
+
 	struct inode vfs_inode;
 };
 
