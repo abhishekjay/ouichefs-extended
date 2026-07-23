@@ -1,5 +1,5 @@
 obj-m += ouichefs.o
-ouichefs-objs := fs.o super.o inode.o file.o dir.o
+ouichefs-objs := fs.o super.o inode.o file.o dir.o sysfs.o
 
 KERNELDIR ?= $(HOME)/linux
 

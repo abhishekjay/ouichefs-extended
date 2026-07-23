@@ -80,6 +80,10 @@ struct ouichefs_sb_info {
 
 	unsigned long *ifree_bitmap; /* In-memory free inodes bitmap */
 	unsigned long *bfree_bitmap; /* In-memory free blocks bitmap */
+
+	struct super_block *sb;
+	uint32_t gc_runs;
+	struct kobject kobj;
 };
 
 struct ouichefs_extent {
@@ -118,5 +122,10 @@ int ouichefs_truncate(struct inode *inode);
 #define OUICHEFS_SB(sb) ((sb)->s_fs_info)
 #define OUICHEFS_INODE(inode) \
 	(container_of(inode, struct ouichefs_inode_info, vfs_inode))
+
+int ouichefs_sysfs_init(void);
+void ouichefs_sysfs_exit(void);
+int ouichefs_sysfs_sb_init(struct ouichefs_sb_info *sbi, struct super_block *sb);
+void ouichefs_sysfs_sb_exit(struct ouichefs_sb_info *sbi);
 
 #endif /* _OUICHEFS_H */
