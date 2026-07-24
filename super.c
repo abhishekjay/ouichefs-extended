@@ -141,8 +141,11 @@ static void ouichefs_evict_inode(struct inode *inode)
 				uint32_t start_block = le32_to_cpu(file_index->extents[i].start);
 				uint32_t count = le32_to_cpu(file_index->extents[i].count);
 
-				if (!start_block || !count)
+				if (!count)
 					break;
+
+				if (!start_block)
+					continue;
 
 				for (j = 0; j < count; j++)
 					put_block(sbi, start_block + j);
