@@ -24,6 +24,7 @@ uint32_t reservation_size = 8;
 module_param(reservation_size, uint, 0644);
 MODULE_PARM_DESC(reservation_size, "Default extent block reservation size");
 
+//garbage collector
 static void ouichefs_run_gc(struct super_block *sb)
 {
 	struct inode *inode;
@@ -57,6 +58,7 @@ static void ouichefs_run_gc(struct super_block *sb)
 	spin_unlock(&sb->s_inode_list_lock);
 }
 
+//contiguous block allocator
 static uint32_t ouichefs_alloc_contiguous(struct super_block *sb, uint32_t requested, uint32_t *block)
 {
 	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
@@ -130,8 +132,8 @@ static uint32_t ouichefs_extent_get_block(struct ouichefs_extent *extents, uint3
 
 		if (logical_block < cumul + count) {
 
-			if (start == 0)
-				return 0;
+			if (start == 0) //denotes a sparse file hole
+				return OUICHEFS_HOLE_BLOCK;
 
 			return start + (logical_block - cumul);
 		}
@@ -141,6 +143,7 @@ static uint32_t ouichefs_extent_get_block(struct ouichefs_extent *extents, uint3
 	return 0;
 }
 
+//mapping blocks for page cache
 static int ouichefs_file_get_block(struct inode *inode, sector_t iblock,
 				   struct buffer_head *bh_result, int create)
 {
@@ -148,7 +151,7 @@ static int ouichefs_file_get_block(struct inode *inode, sector_t iblock,
 	struct ouichefs_inode_info *ci = OUICHEFS_INODE(inode);
 	struct ouichefs_file_index_block *index;
 	struct buffer_head *bh_index;
-	int ret = 0, i, last_ext = -1;
+	int ret = 0;
 	uint32_t bno;
 
 	/* If block number exceeds filesize, fail */
@@ -168,44 +171,22 @@ static int ouichefs_file_get_block(struct inode *inode, sector_t iblock,
 
 	bno = ouichefs_extent_get_block(index->extents, iblock);
 
+	//if it is a hole, do not map the buffer
+	if (bno == OUICHEFS_HOLE_BLOCK) {
+		ret = 0;
+		goto brelse_index;
+	}
+
 	if (bno == 0) {
 		if (!create) {
 			ret = 0;
 			goto brelse_index;
 		}
-
-		if (ouichefs_alloc_contiguous(sb, 1, &bno) == 0) {
-			ret = -ENOSPC;
-			goto brelse_index;
-		}
-
-		for (i = 0; i < OUICHEFS_MAX_EXTENTS; i++) {
-			if (le32_to_cpu(index->extents[i].count) == 0)
-				break;
-			last_ext = i;
-		}
-
-		if (last_ext >= 0 && le32_to_cpu(index->extents[last_ext].start) + le32_to_cpu(index->extents[last_ext].count) == bno) {
-			uint32_t c = le32_to_cpu(index->extents[last_ext].count);
-
-			index->extents[last_ext].count = cpu_to_le32(c + 1);
-		} else {
-			if (last_ext + 1 >= OUICHEFS_MAX_EXTENTS) {
-				ret = -EFBIG;
-				goto brelse_index;
-			}
-			index->extents[last_ext + 1].start = cpu_to_le32(bno);
-			index->extents[last_ext + 1].count = cpu_to_le32(1);
-		}
-
-		inode->i_blocks += (sb->s_blocksize >> 9);
-
-		mark_inode_dirty(inode);
-		mark_buffer_dirty(bh_index);
-	}
-
-	/* Map the physical block to the given buffer_head */
-	map_bh(bh_result, sb, bno);
+		//for sparse files, we bypass page cache, so we return error
+		//if page cache tries to allocate past EOF
+		ret = -ENOSPC;
+	} else
+		map_bh(bh_result, sb, bno); //map physical block to given buffer_head
 
 brelse_index:
 	brelse(bh_index);
@@ -285,6 +266,7 @@ static int ouichefs_write_end(struct file *file, struct address_space *mapping,
 	return ret;
 }
 
+//implementing read operation with hole support
 ssize_t ouichefs_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
 	struct inode *inode = file_inode(file);
@@ -314,15 +296,21 @@ ssize_t ouichefs_read(struct file *file, char __user *buf, size_t count, loff_t 
 		return -EIO;
 
 	index = (struct ouichefs_file_index_block *)bh_index->b_data;
-
 	// find real physical block number
-	//phys_block = le32_to_cpu(index->blocks[block_idx]);
-	// using extents
 	phys_block = ouichefs_extent_get_block(index->extents, block_idx);
 	brelse(bh_index); //done with index block
 
 	if (phys_block == 0)
 		return -EIO;
+
+	//if reading a hole, feed zeros to user space
+	if (phys_block == OUICHEFS_HOLE_BLOCK) {
+		if (clear_user(buf, to_copy))
+			return -EFAULT;
+
+		*ppos += to_copy;
+		return to_copy;
+	}
 
 	bh_data = sb_bread(sb, phys_block);
 	if (!bh_data)
@@ -339,6 +327,7 @@ ssize_t ouichefs_read(struct file *file, char __user *buf, size_t count, loff_t 
 	return to_copy;
 }
 
+//write operation and gap analysis
 ssize_t ouichefs_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
 {
 	struct inode *inode = file_inode(file);
@@ -366,36 +355,76 @@ ssize_t ouichefs_write(struct file *file, const char __user *buf, size_t count, 
 
 	phys_block = ouichefs_extent_get_block(index->extents, block_idx);
 
-	if (phys_block == 0) {
+	if (phys_block == 0 || phys_block == OUICHEFS_HOLE_BLOCK) {
 		//allocate a new block from disk
-		int last_ext = -1, i;
+		int last_ext = -1, hole_idx = -1;
+		uint32_t cumul = 0, hole_offset = 0;
+		int num_extents = 0, i;
 
-		uint32_t requested, allocated;
+		//analyse array for gap insertion points or hole indices
+		for (i = 0; i < OUICHEFS_MAX_EXTENTS; i++) {
+			uint32_t c_ext = le32_to_cpu(index->extents[i].count);
 
-		requested = (count + block_size - 1) / block_size;
+			if (c_ext == 0)
+				break;
 
-		allocated = 0;
+			if (block_idx >= cumul && block_idx < cumul + c_ext) {
+				hole_idx = i;
 
-		//thread-safe block reservation
+				hole_offset = block_idx - cumul;
+
+			}
+
+			cumul += c_ext;
+
+			last_ext = i;
+
+			num_extents++;
+		}
+
+		//insert a hole extent if writing past EOF
+		if (phys_block == 0 && block_idx > cumul) {
+
+			uint32_t gap = block_idx - cumul;
+
+			if (last_ext >= 0 && le32_to_cpu(index->extents[last_ext].start) == 0) {
+				uint32_t c = le32_to_cpu(index->extents[last_ext].count);
+
+				index->extents[last_ext].count = cpu_to_le32(c + gap);
+
+			} else {
+				if (num_extents >= OUICHEFS_MAX_EXTENTS)
+					brelse(bh_index); return -ENOSPC;
+
+				last_ext++;
+				index->extents[last_ext].start = cpu_to_le32(0);
+				index->extents[last_ext].count = cpu_to_le32(gap);
+				num_extents++;
+			}
+			cumul += gap;
+		}
+
+		// Block Allocator and Reservation Engine
+		uint32_t requested = (count + block_size - 1) / block_size;
+		uint32_t allocated = 0;
+
 		spin_lock(&inode->i_lock);
 		if (ci->i_reserved_count > 0) {
-			//grab blocks from private stash
 			phys_block = ci->i_reserved_start;
 			allocated = min_t(uint32_t, requested, ci->i_reserved_count);
 			ci->i_reserved_start += allocated;
 			ci->i_reserved_count -= allocated;
 			spin_unlock(&inode->i_lock);
 		} else {
-			//goto disk
 			spin_unlock(&inode->i_lock);
 
 			uint32_t to_alloc = max_t(uint32_t, requested, reservation_size);
 			uint32_t actual_alloc = ouichefs_alloc_contiguous(sb, to_alloc, &phys_block);
 
 			if (actual_alloc == 0) {
-				//disk full
 				ouichefs_run_gc(sb);
 				actual_alloc = ouichefs_alloc_contiguous(sb, to_alloc, &phys_block);
+
 				if (actual_alloc == 0) {
 					brelse(bh_index);
 					return -ENOSPC;
@@ -403,47 +432,90 @@ ssize_t ouichefs_write(struct file *file, const char __user *buf, size_t count, 
 			}
 
 			if (actual_alloc > requested) {
-				//grabbed extra blocks, stash for later writes
 				allocated = requested;
 				spin_lock(&inode->i_lock);
 				ci->i_reserved_start = phys_block + requested;
 				ci->i_reserved_count = actual_alloc - requested;
 				spin_unlock(&inode->i_lock);
-			} else {
+			} else
 				allocated = actual_alloc;
-			}
-
 		}
 
-		for (i = 0; i < OUICHEFS_MAX_EXTENTS; i++) {
-			if (le32_to_cpu(index->extents[i].count) == 0)
-				break;
-			last_ext = i;
-		}
+		// splitting an existing hole safely
+		if (hole_idx >= 0) {
+			uint32_t orig_count = le32_to_cpu(index->extents[hole_idx].count);
 
-		if (last_ext >= 0 &&
-				le32_to_cpu(index->extents[last_ext].start) +
-				le32_to_cpu(index->extents[last_ext].count) == phys_block) {
-			uint32_t c = le32_to_cpu(index->extents[last_ext].count);
+			allocated = min_t(uint32_t, allocated, orig_count - hole_offset);
 
-			index->extents[last_ext].count = cpu_to_le32(c + allocated);
+			int slots_needed = 0;
 
-		} else {
-			if (last_ext + 1 >= OUICHEFS_MAX_EXTENTS) {
+			if (hole_offset > 0)
+				slots_needed++;
+			if (hole_offset + allocated < orig_count)
+				slots_needed++;
+
+			if (num_extents + slots_needed - 1 >= OUICHEFS_MAX_EXTENTS) {
 				brelse(bh_index);
 				return -ENOSPC;
 			}
-			index->extents[last_ext + 1].start = cpu_to_le32(phys_block);
-			index->extents[last_ext + 1].count = cpu_to_le32(allocated);
+
+			if (hole_offset == 0 && allocated == orig_count) {
+				index->extents[hole_idx].start = cpu_to_le32(phys_block);
+
+			} else if (hole_offset == 0) {
+				memmove(&index->extents[hole_idx + 2], &index->extents[hole_idx + 1],
+						(OUICHEFS_MAX_EXTENTS - 2 - hole_idx) * sizeof(struct ouichefs_extent));
+				index->extents[hole_idx].start = cpu_to_le32(phys_block);
+				index->extents[hole_idx].count = cpu_to_le32(allocated);
+				index->extents[hole_idx + 1].start = cpu_to_le32(0);
+				index->extents[hole_idx + 1].count = cpu_to_le32(orig_count - allocated);
+			} else if (hole_offset + allocated == orig_count) {
+				memmove(&index->extents[hole_idx + 2], &index->extents[hole_idx + 1],
+						(OUICHEFS_MAX_EXTENTS - 2 - hole_idx) * sizeof(struct ouichefs_extent));
+				index->extents[hole_idx].count = cpu_to_le32(hole_offset);
+				index->extents[hole_idx + 1].start = cpu_to_le32(phys_block);
+				index->extents[hole_idx + 1].count = cpu_to_le32(allocated);
+			} else {
+				memmove(&index->extents[hole_idx + 3], &index->extents[hole_idx + 1],
+						(OUICHEFS_MAX_EXTENTS - 3 - hole_idx) * sizeof(struct ouichefs_extent));
+				index->extents[hole_idx].count = cpu_to_le32(hole_offset);
+				index->extents[hole_idx + 1].start = cpu_to_le32(phys_block);
+				index->extents[hole_idx + 1].count = cpu_to_le32(allocated);
+				index->extents[hole_idx + 2].start = cpu_to_le32(0);
+				index->extents[hole_idx + 2].count = cpu_to_le32(orig_count - hole_offset - allocated);
+			}
+		} else {
+			// Normal Append
+			if (last_ext >= 0 &&
+					le32_to_cpu(index->extents[last_ext].start) != 0 &&
+					le32_to_cpu(index->extents[last_ext].start) +
+					le32_to_cpu(index->extents[last_ext].count) == phys_block) {
+
+				uint32_t c = le32_to_cpu(index->extents[last_ext].count);
+
+				index->extents[last_ext].count = cpu_to_le32(c + allocated);
+
+			} else {
+				if (num_extents >= OUICHEFS_MAX_EXTENTS) {
+					brelse(bh_index);
+					return -ENOSPC;
+				}
+				last_ext++;
+				index->extents[last_ext].start = cpu_to_le32(phys_block);
+
+				index->extents[last_ext].count = cpu_to_le32(allocated);
+
+			}
 		}
+
 		mark_buffer_dirty(bh_index);
 		inode->i_blocks += (allocated * (sb->s_blocksize >> 9));
 		mark_inode_dirty(inode);
 	}
 	brelse(bh_index);
 
-	//now there is a physical block to write to
-	bh_data = sb_bread(sb, phys_block); //load first using sb_bread
+	//append standard extents and copy user data
+	bh_data = sb_bread(sb, phys_block);
 	if (!bh_data)
 		return -EIO;
 
@@ -460,7 +532,7 @@ ssize_t ouichefs_write(struct file *file, const char __user *buf, size_t count, 
 	}
 
 	set_buffer_uptodate(bh_data);
-	mark_buffer_dirty(bh_data); // Mark for disk sync
+	mark_buffer_dirty(bh_data);
 	unlock_buffer(bh_data);
 	brelse(bh_data);
 
@@ -469,7 +541,6 @@ ssize_t ouichefs_write(struct file *file, const char __user *buf, size_t count, 
 		i_size_write(inode, *ppos);
 		mark_inode_dirty(inode);
 	}
-
 	return to_copy;
 }
 
@@ -573,8 +644,14 @@ int ouichefs_truncate(struct inode *inode)
 		uint32_t count = le32_to_cpu(index->extents[i].count);
 		uint32_t j;
 
-		if (!start || !count)
+		if (!count)
 			break;
+
+		// skip freeing physical blocks if it is a hole
+		if (!start) {
+			index->extents[i].count = cpu_to_le32(0);
+			continue;
+		}
 
 		for (j = 0; j < count; j++)
 			inode->i_blocks -= (sb->s_blocksize >> 9);

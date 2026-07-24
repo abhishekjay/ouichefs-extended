@@ -40,6 +40,7 @@ static void ouichefs_get_stats(struct ouichefs_sb_info *sbi, struct ouichefs_sta
 
 		spin_lock(&inode->i_lock);
 		stats->reserved_blocks += ci->i_reserved_count;
+
 		spin_unlock(&inode->i_lock);
 	}
 	spin_unlock(&sb->s_inode_list_lock);
@@ -55,7 +56,8 @@ static void ouichefs_get_stats(struct ouichefs_sb_info *sbi, struct ouichefs_sta
 
 		struct ouichefs_inode *disk_inode = (struct ouichefs_inode *)bh->b_data + inode_shift;
 
-		if (le32_to_cpu(disk_inode->i_nlink) > 0 && S_ISREG(le32_to_cpu(disk_inode->i_mode))) {
+		if (le32_to_cpu(disk_inode->i_nlink) > 0 &&
+				S_ISREG(le32_to_cpu(disk_inode->i_mode))) {
 			stats->files++;
 
 			uint64_t size = le32_to_cpu(disk_inode->i_size);
@@ -74,6 +76,7 @@ static void ouichefs_get_stats(struct ouichefs_sb_info *sbi, struct ouichefs_sta
 
 					for (i = 0; i < OUICHEFS_MAX_EXTENTS; i++) {
 						uint32_t count = le32_to_cpu(index->extents[i].count);
+
 						if (count == 0)
 							break;
 
@@ -93,8 +96,10 @@ static void ouichefs_get_stats(struct ouichefs_sb_info *sbi, struct ouichefs_sta
 	// Compute derived metrics (multiplied by 100 for decimals)
 	if (stats->total_extents > 0)
 		stats->avg_extent_size = (stats->committed_blocks * 100) / stats->total_extents;
+
 	if (stats->files > 0)
 		stats->fragmentation = (stats->total_extents * 100) / stats->files;
+
 }
 
 // Macro to quickly generate read-only sysfs files
