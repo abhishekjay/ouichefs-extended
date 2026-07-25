@@ -24,6 +24,13 @@ uint32_t reservation_size = 8;
 module_param(reservation_size, uint, 0644);
 MODULE_PARM_DESC(reservation_size, "Default extent block reservation size");
 
+extern int ouichefs_defrag_file(struct inode *inode);
+
+//defragmentation threshold
+uint32_t defrag_threshold = 400;
+module_param(defrag_threshold, uint, 0644);
+MODULE_PARM_DESC(defrag_threshold, "Fragmentation threshold for auto-defrag (100)");
+
 //garbage collector
 static void ouichefs_run_gc(struct super_block *sb)
 {
@@ -141,6 +148,171 @@ static uint32_t ouichefs_extent_get_block(struct ouichefs_extent *extents, uint3
 		cumul += count;
 	}
 	return 0;
+}
+
+//add defragmentation logic
+int ouichefs_defrag_file(struct inode *inode)
+{
+	struct super_block *sb = inode->i_sb;
+	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
+	struct ouichefs_inode_info *ci = OUICHEFS_INODE(inode);
+	struct buffer_head *bh_index;
+	struct ouichefs_file_index_block *index;
+	uint32_t total_blocks, new_start, i, j;
+	struct ouichefs_extent *old_extents;
+	int extents_count = 0;
+
+	total_blocks = (i_size_read(inode) + sb->s_blocksize - 1) / sb->s_blocksize;
+	if (total_blocks <= 1)
+		return 0;
+
+	bh_index = sb_bread(sb, ci->index_block);
+	if (!bh_index)
+		return -EIO;
+
+	index = (struct ouichefs_file_index_block *)bh_index->b_data;
+
+	//check if it is already defragmented
+	for (i = 0; i < OUICHEFS_MAX_EXTENTS; i++) {
+		if (le32_to_cpu(index->extents[i].count) != 0)
+			extents_count++;
+	}
+
+	if (extents_count <= 1) {
+		brelse(bh_index);
+		return 0;
+	}
+
+	uint32_t allocated = ouichefs_alloc_contiguous(sb, total_blocks, &new_start);
+
+	if (allocated < total_blocks) {
+		if (allocated > 0) {
+			for (i = 0; i < allocated; i++)
+				put_block(sbi, new_start + i);
+		}
+
+		brelse(bh_index);
+		return -ENOSPC;
+	}
+
+	old_extents = kmalloc(OUICHEFS_BLOCK_SIZE, GFP_KERNEL);
+	if (!old_extents) {
+		brelse(bh_index);
+		return -ENOMEM;
+	}
+	memcpy(old_extents, index->extents, OUICHEFS_BLOCK_SIZE);
+
+	//copy data block-by-block from the fragmented area to the new contiguous area
+	for (i = 0; i < total_blocks; i++) {
+		uint32_t old_phys = ouichefs_extent_get_block(old_extents, i);
+		struct buffer_head *bh_new = sb_getblk(sb, new_start + i);
+
+		if (old_phys == OUICHEFS_HOLE_BLOCK || old_phys == 0)
+			memset(bh_new->b_data, 0, sb->s_blocksize);
+		else {
+			struct buffer_head *bh_old = sb_bread(sb, old_phys);
+
+			if (bh_old) {
+				memcpy(bh_new->b_data, bh_old->b_data, sb->s_blocksize);
+				brelse(bh_old);
+			} else
+				memset(bh_new->b_data, 0, sb->s_blocksize);
+		}
+		set_buffer_uptodate(bh_new);
+		mark_buffer_dirty(bh_new);
+		brelse(bh_new);
+	}
+
+	//overwrite the index to point to the new single extent
+	index->extents[0].start = cpu_to_le32(new_start);
+	index->extents[0].count = cpu_to_le32(total_blocks);
+	for (i = 1; i < OUICHEFS_MAX_EXTENTS; i++) {
+		index->extents[i].start = cpu_to_le32(0);
+		index->extents[i].count = cpu_to_le32(0);
+	}
+	mark_buffer_dirty(bh_index);
+	brelse(bh_index);
+
+	//free the old fragmented blocks back to the file system
+	for (i = 0; i < OUICHEFS_MAX_EXTENTS; i++) {
+		uint32_t start = le32_to_cpu(old_extents[i].start);
+		uint32_t count = le32_to_cpu(old_extents[i].count);
+
+		if (count == 0)
+			break;
+		if (start != 0) {
+			for (j = 0; j < count; j++)
+				put_block(sbi, start + j);
+		}
+	}
+	kfree(old_extents);
+
+	//update the inode, sparse holes are now filled with real physical zeroes
+	inode->i_blocks = total_blocks * (sb->s_blocksize >> 9);
+	mark_inode_dirty(inode);
+
+	pr_info("Successfully defragmented inode %lu into 1 extent\n", inode->i_ino);
+	return 0;
+}
+EXPORT_SYMBOL(ouichefs_defrag_file);
+
+//auto-defragmentation scanner
+static void ouichefs_check_and_run_defrag(struct super_block *sb)
+{
+	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
+	uint32_t ino, files = 0, total_extents = 0;
+
+	for (ino = 1; ino < sbi->nr_inodes; ino++) {
+		uint32_t inode_block = (ino / OUICHEFS_INODES_PER_BLOCK) + 1;
+		uint32_t inode_shift = ino % OUICHEFS_INODES_PER_BLOCK;
+		struct buffer_head *bh = sb_bread(sb, inode_block);
+
+		if (!bh)
+			continue;
+		struct ouichefs_inode *disk_inode = (struct ouichefs_inode *)bh->b_data + inode_shift;
+
+		if (le32_to_cpu(disk_inode->i_nlink) > 0 && S_ISREG(le32_to_cpu(disk_inode->i_mode))) {
+			files++;
+			uint32_t idx_blk = le32_to_cpu(disk_inode->index_block);
+
+			if (idx_blk) {
+				struct buffer_head *idx_bh = sb_bread(sb, idx_blk);
+
+				if (idx_bh) {
+					struct ouichefs_file_index_block *index = (struct ouichefs_file_index_block *)idx_bh->b_data;
+
+					int i;
+
+					for (i = 0; i < OUICHEFS_MAX_EXTENTS; i++) {
+						if (le32_to_cpu(index->extents[i].count) == 0)
+							break;
+						if (le32_to_cpu(index->extents[i].start) != 0)
+							total_extents++;
+					}
+					brelse(idx_bh);
+				}
+			}
+		}
+		brelse(bh);
+	}
+
+	uint32_t fragmentation = files > 0 ? (total_extents * 100) / files : 0;
+
+	//if above threshold, run global scan and defrag any file with > 1 extent
+	if (fragmentation > defrag_threshold) {
+		pr_info("Fragmentation %u exceeds threshold %u. Running global defrag...\n", fragmentation, defrag_threshold);
+		for (ino = 1; ino < sbi->nr_inodes; ino++) {
+			if (test_bit(ino, (unsigned long *)sbi->ifree_bitmap))
+				continue;
+			struct inode *inode = ouichefs_iget(sb, ino);
+
+			if (!IS_ERR(inode)) {
+				if (S_ISREG(inode->i_mode))
+					ouichefs_defrag_file(inode);
+				iput(inode);
+			}
+		}
+	}
 }
 
 //mapping blocks for page cache
@@ -392,8 +564,11 @@ ssize_t ouichefs_write(struct file *file, const char __user *buf, size_t count, 
 				index->extents[last_ext].count = cpu_to_le32(c + gap);
 
 			} else {
-				if (num_extents >= OUICHEFS_MAX_EXTENTS)
-					brelse(bh_index); return -ENOSPC;
+				if (num_extents >= OUICHEFS_MAX_EXTENTS) {
+
+					brelse(bh_index);
+					return -ENOSPC;
+				}
 
 				last_ext++;
 				index->extents[last_ext].start = cpu_to_le32(0);
@@ -540,6 +715,9 @@ ssize_t ouichefs_write(struct file *file, const char __user *buf, size_t count, 
 		i_size_write(inode, *ppos);
 		mark_inode_dirty(inode);
 	}
+
+	ouichefs_check_and_run_defrag(sb);
+
 	return to_copy;
 }
 
@@ -576,34 +754,40 @@ long ouichefs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	struct ouichefs_file_index_block *index;
 	int i, num_extents = 0;
 
-	if (cmd != OUICHEFS_IOC_GET_EXTENTS)
+	switch (cmd) {
+	case OUICHEFS_IOC_GET_EXTENTS:
+		bh = sb_bread(sb, ci->index_block);
+		if (!bh)
+			return -EIO;
+
+		index = (struct ouichefs_file_index_block *)bh->b_data;
+
+		for (i = 0; i < OUICHEFS_MAX_EXTENTS; i++) {
+			if (le32_to_cpu(index->extents[i].count) == 0)
+				break;
+			num_extents++;
+		}
+
+		pr_info("ouichefs: extents for inode %lu: %d extent(s)\n", inode->i_ino, num_extents);
+
+		for (i = 0; i < num_extents; i++) {
+			uint32_t start = le32_to_cpu(index->extents[i].start);
+
+			uint32_t count = le32_to_cpu(index->extents[i].count);
+
+			pr_info(" [%d] start=%u count=%u (blocks %u-%u)\n",
+					i, start, count, start, start + count - 1);
+		}
+
+		brelse(bh);
+		return 0;
+
+	case OUICHEFS_IOC_DEFRAG_FILE:
+		return ouichefs_defrag_file(inode);
+
+	default:
 		return -ENOTTY;
-
-	bh = sb_bread(sb, ci->index_block);
-	if (!bh)
-		return -EIO;
-
-	index = (struct ouichefs_file_index_block *)bh->b_data;
-
-	for (i = 0; i < OUICHEFS_MAX_EXTENTS; i++) {
-		if (le32_to_cpu(index->extents[i].count) == 0)
-			break;
-		num_extents++;
 	}
-
-	pr_info("ouichefs: extents for inode %lu: %d extent(s)\n", inode->i_ino, num_extents);
-
-	for (i = 0; i < num_extents; i++) {
-		uint32_t start = le32_to_cpu(index->extents[i].start);
-
-		uint32_t count = le32_to_cpu(index->extents[i].count);
-
-		pr_info(" [%d] start=%u count=%u (blocks %u-%u)\n",
-				i, start, count, start, start + count - 1);
-	}
-
-	brelse(bh);
-	return 0;
 }
 
 const struct address_space_operations ouichefs_aops = {

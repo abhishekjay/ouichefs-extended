@@ -130,4 +130,7 @@ void ouichefs_sysfs_exit(void);
 int ouichefs_sysfs_sb_init(struct ouichefs_sb_info *sbi, struct super_block *sb);
 void ouichefs_sysfs_sb_exit(struct ouichefs_sb_info *sbi);
 
+extern uint32_t reservation_size;
+extern uint32_t defrag_threshold;
+
 #endif /* _OUICHEFS_H */

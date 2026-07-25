@@ -6,9 +6,7 @@
 
 #include "ouichefs.h"
 
-extern uint32_t reservation_size;
-
-struct kobject *ouichefs_root_kobj = NULL;
+struct kobject *ouichefs_root_kobj;
 
 struct ouichefs_stats {
 	uint32_t free_blocks;
@@ -104,7 +102,7 @@ static void ouichefs_get_stats(struct ouichefs_sb_info *sbi, struct ouichefs_sta
 
 // Macro to quickly generate read-only sysfs files
 #define OUICHEFS_RO_ATTR(name) \
-static ssize_t name##_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+static ssize_t name##_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) \
 { \
 	struct ouichefs_sb_info *sbi = container_of(kobj, struct ouichefs_sb_info, kobj); \
 	struct ouichefs_stats stats; \
@@ -140,6 +138,23 @@ static ssize_t reservation_size_store(struct kobject *kobj, struct kobj_attribut
 }
 static struct kobj_attribute reservation_size_attr = __ATTR(reservation_size, 0644, reservation_size_show, reservation_size_store);
 
+//custom Read/Write file for defrag_threshold
+static ssize_t defrag_threshold_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", defrag_threshold);
+}
+
+static ssize_t defrag_threshold_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	uint32_t val;
+	if (kstrtouint(buf, 10, &val) < 0)
+		return -EINVAL;
+	defrag_threshold = val;
+	return count;
+}
+
+static struct kobj_attribute defrag_threshold_attr = __ATTR(defrag_threshold, 0644, defrag_threshold_show, defrag_threshold_store);
+
 // Group them all together
 static struct attribute *ouichefs_attrs[] = {
 	&free_blocks_attr.attr,
@@ -152,6 +167,7 @@ static struct attribute *ouichefs_attrs[] = {
 	&fragmentation_attr.attr,
 	&gc_runs_attr.attr,
 	&reservation_size_attr.attr,
+	&defrag_threshold_attr.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(ouichefs);
