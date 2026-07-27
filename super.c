@@ -120,6 +120,14 @@ static void ouichefs_evict_inode(struct inode *inode)
 	 */
 	//safely release any pending reservations before freeing extents
 	spin_lock(&inode->i_lock);
+	
+	if (inode_info->i_reserved_count > 0) {
+		r_start = inode_info->i_reserved_start;
+		r_count = inode_info->i_reserved_count;
+		inode_info->i_reserved_count = 0;
+		inode_info->i_reserved_start = 0;
+	}
+	spin_unlock(&inode->i_lock);
 
 	if (r_count > 0) {
 		for (j = 0; j < r_count; j++)

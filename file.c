@@ -716,7 +716,9 @@ ssize_t ouichefs_write(struct file *file, const char __user *buf, size_t count, 
 		mark_inode_dirty(inode);
 	}
 
-	ouichefs_check_and_run_defrag(sb);
+	//run global defrag if we allocate a new physical block
+	if (phys_block == 0 || phys_block == OUICHEFS_HOLE_BLOCK)
+		ouichefs_check_and_run_defrag(sb);
 
 	return to_copy;
 }
@@ -740,7 +742,7 @@ static int ouichefs_file_release(struct inode *inode, struct file *file)
 
 	if (r_count > 0) {
 		for (j = 0; j < r_count ; j++)
-			put_block(sbi, r_count + j);
+			put_block(sbi, r_start + j);
 	}
 	return 0;
 }
