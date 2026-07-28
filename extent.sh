@@ -72,6 +72,7 @@ echo "> dmesg output (should show ~3-4 scattered extents):"
 dmesg | tail -n 5
 
 echo ""
+sync
 echo "--- 4. Sysfs Statistics (Task 1.8) ---"
 if [ -d "$SYSFS_DIR" ]; then
 echo "Free blocks: $(cat $SYSFS_DIR/free_blocks)"
@@ -91,14 +92,15 @@ dmesg | tail -n 2
 echo ""
 echo "--- 6. Auto-Defragmentation & Sysfs Tuning (Task 1.10) ---"
 if [ -d "$SYSFS_DIR" ]; then
-echo "> Lowering defrag threshold to 200 (2 extents/file limit)..."
-sudo sh -c "echo 200 > $SYSFS_DIR/defrag_threshold"
+echo "> Lowering defrag threshold to 130 (2 extents/file limit)..."
+sudo sh -c "echo 130 > $SYSFS_DIR/defrag_threshold"
 
 # Intentionally fragment a new file
 dd if=/dev/zero of=$MNT/auto.txt bs=1M count=1 status=none
 dd if=/dev/zero of=$MNT/auto.txt bs=1M seek=5 count=1 status=none
 
 echo "> Overwriting the hole to trigger the threshold..."
+sync
 # This write exceeds the threshold, triggering auto-defrag before returning
 dd if=/dev/zero of=$MNT/auto.txt bs=1M seek=2 count=1 conv=notrunc status=none
 
