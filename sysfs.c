@@ -20,7 +20,14 @@ struct ouichefs_stats {
 	uint32_t gc_runs;
 };
 
-//stats aggregation logic
+/*
+ * Global Filesystem Statistics Aggregator:
+ * Computes live metrics for sysfs.
+ * - In-memory reservations are safely gathered using the s_inode_list_lock.
+ * - Disk metrics (fragmentation, extents) are calculated by reading raw
+ *   inode blocks directly off the disk. This bypasses the VFS page cache to
+ *   avoid taking heavy VFS locks during stat generation.
+ */
 static void ouichefs_get_stats(struct ouichefs_sb_info *sbi, struct ouichefs_stats *stats)
 {
 	struct super_block *sb = sbi->sb;
@@ -63,32 +70,35 @@ static void ouichefs_get_stats(struct ouichefs_sb_info *sbi, struct ouichefs_sta
 			if (size > stats->max_file_size)
 				stats->max_file_size = size;
 
-// calculating extent and fragmentation stats
+			// calculating extent and fragmentation stats
 			uint32_t idx_blk = le32_to_cpu(disk_inode->index_block);
+			struct buffer_head *idx_bh;
+			struct ouichefs_file_index_block *index;
 
-			if (idx_blk) {
-				struct buffer_head *idx_bh = sb_bread(sb, idx_blk);
+			if (!idx_blk)
+				continue;
 
-				if (idx_bh) {
-					struct ouichefs_file_index_block *index = (struct ouichefs_file_index_block *)idx_bh->b_data;
+			idx_bh = sb_bread(sb, idx_blk);
+			if (!idx_bh)
+				continue;
 
-					for (i = 0; i < OUICHEFS_MAX_EXTENTS; i++) {
-						uint32_t count = le32_to_cpu(index->extents[i].count);
+			index = (struct ouichefs_file_index_block *)idx_bh->b_data;
 
-						if (count == 0)
-							break;
+			for (i = 0; i < OUICHEFS_MAX_EXTENTS; i++) {
+				uint32_t count = le32_to_cpu(index->extents[i].count);
 
-						// only count real extents, skip holes (start == 0)
-						if (le32_to_cpu(index->extents[i].start) != 0) {
-							stats->total_extents++;
-							stats->committed_blocks += count;
-						}
-					}
-					brelse(idx_bh);
+				if (count == 0)
+					break;
+
+				// only count real extents, skip holes (i.e., if start == 0)
+				if (le32_to_cpu(index->extents[i].start) != 0) {
+					stats->total_extents++;
+					stats->committed_blocks += count;
 				}
 			}
+			brelse(idx_bh);
+
 		}
-		brelse(bh);
 	}
 
 	// Compute derived metrics (multiplied by 100 for decimals)
@@ -109,17 +119,17 @@ static ssize_t name##_show(struct kobject *kobj, struct kobj_attribute *attr, ch
 	ouichefs_get_stats(sbi, &stats); \
 	return sysfs_emit(buf, "%llu\n", (unsigned long long)stats.name); \
 } \
-static struct kobj_attribute name##_attr = __ATTR_RO(name);
+static struct kobj_attribute name##_attr = __ATTR_RO(name)
 
-OUICHEFS_RO_ATTR(free_blocks)
-OUICHEFS_RO_ATTR(committed_blocks)
-OUICHEFS_RO_ATTR(reserved_blocks)
-OUICHEFS_RO_ATTR(files)
-OUICHEFS_RO_ATTR(total_extents)
-OUICHEFS_RO_ATTR(avg_extent_size)
-OUICHEFS_RO_ATTR(max_file_size)
-OUICHEFS_RO_ATTR(fragmentation)
-OUICHEFS_RO_ATTR(gc_runs)
+OUICHEFS_RO_ATTR(free_blocks);
+OUICHEFS_RO_ATTR(committed_blocks);
+OUICHEFS_RO_ATTR(reserved_blocks);
+OUICHEFS_RO_ATTR(files);
+OUICHEFS_RO_ATTR(total_extents);
+OUICHEFS_RO_ATTR(avg_extent_size);
+OUICHEFS_RO_ATTR(max_file_size);
+OUICHEFS_RO_ATTR(fragmentation);
+OUICHEFS_RO_ATTR(gc_runs);
 
 // Custom Read/Write file for reservation_size
 static ssize_t reservation_size_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
@@ -148,9 +158,12 @@ static ssize_t defrag_threshold_show(struct kobject *kobj, struct kobj_attribute
 static ssize_t defrag_threshold_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
 {
 	uint32_t val;
+
 	if (kstrtouint(buf, 10, &val) < 0)
 		return -EINVAL;
+
 	defrag_threshold = val;
+
 	return count;
 }
 
@@ -178,7 +191,7 @@ static void ouichefs_kobj_release(struct kobject *kobj)
 	// Freed by put_super
 }
 
-static struct kobj_type ouichefs_ktype = {
+static const struct kobj_type ouichefs_ktype = {
 	.sysfs_ops = &kobj_sysfs_ops,
 	.release = ouichefs_kobj_release,
 	.default_groups = ouichefs_groups,

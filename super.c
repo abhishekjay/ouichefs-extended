@@ -114,12 +114,20 @@ static void ouichefs_evict_inode(struct inode *inode)
 	truncate_inode_pages_final(&inode->i_data);
 
 	/*
-	 * Cleanup pointed blocks if file/directory is not linked anymore.
-	 * If we fail to read the index block, cleanup inode anyway and
-	 * lose this file/directory's blocks forever.
+	 * Cleanup phase 1: block reservations
+	 * When destroying an inode, we must safely return any pre-reserved,
+	 * unused blocks back to the global free pool using i_lock to avoid
+	 * race conditions with the garbage collector.
 	 */
-	//safely release any pending reservations before freeing extents
 	spin_lock(&inode->i_lock);
+
+	if (inode_info->i_reserved_count > 0) {
+		r_start = inode_info->i_reserved_start;
+		r_count = inode_info->i_reserved_count;
+		inode_info->i_reserved_count = 0;
+		inode_info->i_reserved_start = 0;
+	}
+	spin_unlock(&inode->i_lock);
 
 	if (r_count > 0) {
 		for (j = 0; j < r_count; j++)
@@ -136,7 +144,11 @@ static void ouichefs_evict_inode(struct inode *inode)
 		if (S_ISREG(inode->i_mode)) {
 			file_index = (struct ouichefs_file_index_block *)bh->b_data;
 
-			// free all blocks in each extent
+			/* Cleanup phase 2: extent deallocation
+			 * Iterate over all active extent slots. For each slot,
+			 * loop 'count' times to return every single physical
+			 * block belonging to that extent back to the disk.
+			 */
 			for (i = 0; i < OUICHEFS_MAX_EXTENTS; ++i) {
 				uint32_t start_block = le32_to_cpu(file_index->extents[i].start);
 				uint32_t count = le32_to_cpu(file_index->extents[i].count);

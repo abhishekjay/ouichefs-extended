@@ -24,8 +24,6 @@ uint32_t reservation_size = 8;
 module_param(reservation_size, uint, 0644);
 MODULE_PARM_DESC(reservation_size, "Default extent block reservation size");
 
-extern int ouichefs_defrag_file(struct inode *inode);
-
 //defragmentation threshold
 uint32_t defrag_threshold = 400;
 module_param(defrag_threshold, uint, 0644);
@@ -65,7 +63,13 @@ static void ouichefs_run_gc(struct super_block *sb)
 	spin_unlock(&sb->s_inode_list_lock);
 }
 
-//contiguous block allocator
+/*
+ * Contiguous Block Allocator:
+ * Scans the block bitmap to find the longest contiguous run of free blocks
+ * up to the 'requested' size. Uses a greedy/first-fit approach: if a perfect
+ * match is found, it returns immediately. Otherwise, it remembers and returns
+ * the largest available chunk to minimize extent fragmentation.
+ */
 static uint32_t ouichefs_alloc_contiguous(struct super_block *sb, uint32_t requested, uint32_t *block)
 {
 	struct ouichefs_sb_info *sbi = OUICHEFS_SB(sb);
@@ -150,7 +154,13 @@ static uint32_t ouichefs_extent_get_block(struct ouichefs_extent *extents, uint3
 	return 0;
 }
 
-//add defragmentation logic
+/*
+ * Defragmentation Engine:
+ * 1. Allocates a new, single contiguous block run for the entire file size.
+ * 2. Copies existing data over block-by-block (safely writing zeroes for holes).
+ * 3. Updates the index block to point to the new single extent.
+ * 4. Iterates through the old array and frees the scattered physical blocks.
+ */
 int ouichefs_defrag_file(struct inode *inode)
 {
 	struct super_block *sb = inode->i_sb;
@@ -272,28 +282,29 @@ static void ouichefs_check_and_run_defrag(struct super_block *sb)
 		struct ouichefs_inode *disk_inode = (struct ouichefs_inode *)bh->b_data + inode_shift;
 
 		if (le32_to_cpu(disk_inode->i_nlink) > 0 && S_ISREG(le32_to_cpu(disk_inode->i_mode))) {
-			files++;
 			uint32_t idx_blk = le32_to_cpu(disk_inode->index_block);
+			struct buffer_head *idx_bh;
+			struct ouichefs_file_index_block *index;
+			int i;
 
-			if (idx_blk) {
-				struct buffer_head *idx_bh = sb_bread(sb, idx_blk);
+			files++;
 
-				if (idx_bh) {
-					struct ouichefs_file_index_block *index = (struct ouichefs_file_index_block *)idx_bh->b_data;
+			if (!idx_blk)
+				continue;
 
-					int i;
+			idx_bh = sb_bread(sb, idx_blk);
+			if (!idx_bh)
+				continue;
 
-					for (i = 0; i < OUICHEFS_MAX_EXTENTS; i++) {
-						if (le32_to_cpu(index->extents[i].count) == 0)
-							break;
-						if (le32_to_cpu(index->extents[i].start) != 0)
-							total_extents++;
-					}
-					brelse(idx_bh);
-				}
+			index = (struct ouichefs_file_index_block *)idx_bh->b_data;
+			for (i = 0; i < OUICHEFS_MAX_EXTENTS; i++) {
+				if (le32_to_cpu(index->extents[i].count) == 0)
+					break;
+				if (le32_to_cpu(index->extents[i].start) != 0)
+					total_extents++;
 			}
+			brelse(bh);
 		}
-		brelse(bh);
 	}
 
 	uint32_t fragmentation = files > 0 ? (total_extents * 100) / files : 0;
@@ -459,7 +470,6 @@ ssize_t ouichefs_read(struct file *file, char __user *buf, size_t count, loff_t 
 
 	unsigned long block_idx = *ppos / block_size;
 	size_t offset = *ppos % block_size;
-
 	size_t to_copy = min_t(size_t, count, block_size - offset);
 
 	// read block index
@@ -584,6 +594,12 @@ ssize_t ouichefs_write(struct file *file, const char __user *buf, size_t count, 
 		uint32_t allocated = 0;
 
 		spin_lock(&inode->i_lock);
+		/*
+		 * Write-time block reservation engine:
+		 * Consume pre-reserved blocks first. If empty, allocate a large
+		 * chunk (reservation size) to prevent interleaving fragmentation
+		 * caused by concurrent writers appending to different files
+		 */
 		if (ci->i_reserved_count > 0) {
 			phys_block = ci->i_reserved_start;
 			allocated = min_t(uint32_t, requested, ci->i_reserved_count);
@@ -616,7 +632,13 @@ ssize_t ouichefs_write(struct file *file, const char __user *buf, size_t count, 
 				allocated = actual_alloc;
 		}
 
-		// splitting an existing hole safely
+		/*
+		 * Sparse Hole Splitting:
+		 * If writing directly into the middle of a sparse hole, we must
+		 * split the existing hole extent into up to three pieces:
+		 * [remaining hole before] -> [new data] -> [remaining hole after].
+		 * We use memmove() to shift the array right to make room.
+		 */
 		if (hole_idx >= 0) {
 			uint32_t orig_count = le32_to_cpu(index->extents[hole_idx].count);
 
@@ -717,7 +739,9 @@ ssize_t ouichefs_write(struct file *file, const char __user *buf, size_t count, 
 		mark_inode_dirty(inode);
 	}
 
-	ouichefs_check_and_run_defrag(sb);
+	//run global defrag if we allocate a new physical block
+	if (phys_block == 0 || phys_block == OUICHEFS_HOLE_BLOCK)
+		ouichefs_check_and_run_defrag(sb);
 
 	return to_copy;
 }
@@ -741,7 +765,7 @@ static int ouichefs_file_release(struct inode *inode, struct file *file)
 
 	if (r_count > 0) {
 		for (j = 0; j < r_count ; j++)
-			put_block(sbi, r_count + j);
+			put_block(sbi, r_start + j);
 	}
 	return 0;
 }
