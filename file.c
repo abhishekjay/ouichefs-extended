@@ -520,6 +520,8 @@ ssize_t ouichefs_write(struct file *file, const char __user *buf, size_t count, 
 	char *data;
 	size_t block_size = sb->s_blocksize;
 	uint32_t phys_block;
+	/* flag to track allocation state */
+	int is_new_block = 0; /* flag to track allocation state */
 
 	if (file->f_flags & O_APPEND)
 		*ppos = i_size_read(inode);
@@ -708,19 +710,33 @@ ssize_t ouichefs_write(struct file *file, const char __user *buf, size_t count, 
 		mark_buffer_dirty(bh_index);
 		inode->i_blocks += (allocated * (sb->s_blocksize >> 9));
 		mark_inode_dirty(inode);
+
+		//flag that we just created this physical block
+		is_new_block = 1;
 	}
 	brelse(bh_index);
 
-	//append standard extents and copy user data
-	bh_data = sb_bread(sb, phys_block);
-	if (!bh_data)
-		return -EIO;
+	// Safely fetch block depending on whether existing or new
+	if (is_new_block) {
+		bh_data = sb_getblk(sb, phys_block);
+		if (!bh_data)
+			return -ENOMEM;
 
-	lock_buffer(bh_data);
+		lock_buffer(bh_data);
+
+		//wipes entire new block from offset 0 to sanitise it
+		memset(bh_data->b_data, 0, block_size);
+	} else {
+		//bread safely reads existing data
+		bh_data = sb_bread(sb, phys_block);
+		if (!bh_data)
+			return -EIO;
+
+		//no memset because block already holds valid data
+		lock_buffer(bh_data);
+	}
+
 	data = bh_data->b_data + offset;
-
-	if (to_copy < block_size)
-		memset(data, 0, block_size);
 
 	if (copy_from_user(data, buf, to_copy)) {
 		unlock_buffer(bh_data);
@@ -739,8 +755,8 @@ ssize_t ouichefs_write(struct file *file, const char __user *buf, size_t count, 
 		mark_inode_dirty(inode);
 	}
 
-	//run global defrag if we allocate a new physical block
-	if (phys_block == 0 || phys_block == OUICHEFS_HOLE_BLOCK)
+	//run global defrag if the flag is set
+	if (is_new_block)
 		ouichefs_check_and_run_defrag(sb);
 
 	return to_copy;

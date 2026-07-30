@@ -153,12 +153,15 @@ static void ouichefs_evict_inode(struct inode *inode)
 				uint32_t start_block = le32_to_cpu(file_index->extents[i].start);
 				uint32_t count = le32_to_cpu(file_index->extents[i].count);
 
-				if (!count)
+				// end of extent array
+				if (count == 0)
 					break;
 
-				if (!start_block)
+				// SKIP sparse holes, but dont abort loop
+				if (start_block == 0)
 					continue;
 
+				// free real physical blocks
 				for (j = 0; j < count; j++)
 					put_block(sbi, start_block + j);
 			}
@@ -179,6 +182,14 @@ static void ouichefs_evict_inode(struct inode *inode)
 	}
 
 invalidate:
+	/* push i_nlink=0 state to the actual disk
+	 * This ensures sysfs.c skips this deleted inode when scanning the
+	 * disk, preventing it from parsing reallocated user text as an
+	 * extent array
+	 */
+	if (!inode->i_nlink)
+		ouichefs_write_inode(inode, NULL);
+
 	invalidate_inode_buffers(inode);
 	clear_inode(inode);
 
