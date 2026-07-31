@@ -1,3 +1,33 @@
+# OUICHEFS EXTENDED
+The aim of this project was to extend the functionalities of the simple OuicheFS filesystem (more info below) by introducing key modifications and upgrades to its software architecture. The project was part of the course on Linux Kernel Programming at RWTH Aachen University.
+
+### Implemented and Functional Features
+- Extent-Based Storage: Successfully replaced the flat block limit with an Endian-safe 512-slot array.
+- Contiguous Block Allocation: Functional First-Fit bitmap scanning supporting "Best-Effort" fallbacks.
+- Write-Time Reservations: spin_lock-protected RAM caching to prevent interleaved fragmentation.
+- Global Garbage Collection: Safe revocation of unused reservations across all VFS inodes upon ENOSPC.
+- Sparse File & Hole Punching: Zero-fill reading and memory-safe extent array splitting (memmove).
+- Sysfs Global Statistics: Read-only metrics (bypassing VFS locks via sb_bread) and writable tunables.
+- Online Manual Defragmentation: IOCTL-driven block migration, consolidation, and dirty-block sanitization.
+
+### Implemented but Not Fully Functional / Known Issues
+- Auto-Defragmentation Scanner Synchronization
+Problem: The auto-defragmentation does not trigger accurately on checking fragmentation after a write() operation.
+Could be due to a syncing issue between the RAM and the disk. The scanner checks the disk at the end of a write, but the write which caused the fragmentation has not been reflected in the disk yet.
+Potential Fix: We used sync command in extent.sh to force this behaviour during testing
+- Ghost Leak
+Problem: We encounter a ghost leak when running automated test script 22: Sysfs block invariant.
+Why we think it occurs: This could be due to a faulty hole-splitting algorithm which in specific scenarios doesn’t use the entire allocated blocks. 
+Potential Fix: Calculate leftover blocks during splitting, put them into the file’s temporary memory stash
+Running Test 22: Sysfs block invariant… [FAIL] Sysfs invariant broken! Before IO: 12508, After IO: 12507 
+
+### Not Implemented (Future directions)
+- Task 1.11 – Bonus: Advanced Block Allocator
+Task 1.11 was not implemented due to time constraints. Replacing the linear bitmap-based contiguous allocator with a complex mechanism like buddy-allocator could not be attempted. We decided to prioritize the challenges in the existing tasks 1.2 through 1.10 and think of mitigating edge-case scenarios that may arise within these tasks.
+
+The following was the initial OuicheFS filesystem design
+-------------------------------------------------------------------------------
+
 # ouiche_fs - a simple educational filesystem for Linux
 The main objective of this project is to provide a simple Linux filesystem for students to build on.
 
