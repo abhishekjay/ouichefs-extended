@@ -1,5 +1,5 @@
 # OUICHEFS EXTENDED
-The aim of this project was to extend the functionalities of the simple OuicheFS filesystem (more info below) by introducing key modifications and upgrades to its software architecture. The project was part of the course on Linux Kernel Programming at RWTH Aachen University.
+The aim of this project was to extend the functionalities of the simple OuicheFS filesystem (more info below) by introducing key modifications and upgrades to its software architecture. The project was part of the course on Linux Kernel Programming at RWTH Aachen University (https://teaching.os.rwth-aachen.de/LKP/)
 
 ### Implemented and Functional Features
 - Extent-Based Storage: Successfully replaced the flat block limit with an Endian-safe 512-slot array.
